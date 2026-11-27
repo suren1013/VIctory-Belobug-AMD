@@ -582,9 +582,8 @@ struct Lane {
     closed: bool,
 }
 
-// SAFETY: requests point into title memory and our own objects, which stay
-// valid until the title has seen them complete; status arrays count their
-// references atomically.
+// SAFETY: the title keeps its buffers valid until completion. Queued reads
+// and status commands hold atomic references to their runtime objects.
 unsafe impl Send for Lane {}
 
 /// A read a worker runs.
@@ -594,6 +593,7 @@ struct Job {
     request: Request,
     note: Note,
     staging: u64,
+    source_file: Option<FileRef>,
 }
 
 // SAFETY: as for `Lane`.
@@ -775,7 +775,7 @@ pub(crate) mod stream_log {
 fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
     loop {
-        let Some(job) = lanes.start() else {
+        let Some(mut job) = lanes.start() else {
             lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
             continue;
         };
@@ -790,6 +790,9 @@ fn work(scheduler: &'static Scheduler) {
         if let Some(traced) = traced {
             traced.end(&job, &result);
         }
+        // Release the source outside the scheduler lock and before a status
+        // can tell the title that the read has completed.
+        drop(job.source_file.take());
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -845,14 +848,13 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, Read { request, note }) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let staging = staging_bytes(&lane.reads.front()?.1.request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (seq, Read { request, note, source_file }) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -866,6 +868,7 @@ impl Lanes {
             request,
             note,
             staging,
+            source_file,
         })
     }
 
@@ -1029,8 +1032,24 @@ const ZLIB: u64 = 1;
 const BCPACK: u64 = 0xf << 1;
 const PAGE_DESTINATION: u64 = 1 << 21;
 const MEMORY_SOURCE: u64 = 1 << 22;
+const SUPPORTED_OPTIONS: u64 = ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE;
 // Bits 5-20 select a further transform, bit 23 a source in physical pages;
 // The title's packages need neither, so requests with them fail.
+
+impl Request {
+    fn validate(&self) -> Result<(), (HRESULT, &'static str)> {
+        if self.options & !SUPPORTED_OPTIONS != 0 {
+            return Err((E_NOTIMPL, "unsupported options"));
+        }
+        if self.source.is_null() || self.destination.is_null() {
+            return Err((E_INVALIDARG, "no source or destination"));
+        }
+        if self.options & (ZLIB | BCPACK) == 0 && self.source_size > self.destination_size {
+            return Err((E_INVALIDARG, "source larger than destination"));
+        }
+        Ok(())
+    }
+}
 
 const PAGE: usize = 64 * 1024;
 
@@ -1040,10 +1059,31 @@ enum Command {
 }
 
 /// An enqueued request, and what the trace knows of it.
-#[derive(Clone, Copy)]
 struct Read {
     request: Request,
     note: Note,
+    source_file: Option<FileRef>,
+}
+
+/// Keeps a file open from enqueue until the worker finishes or the read is cancelled.
+struct FileRef(*mut Instance<File>);
+
+impl FileRef {
+    fn retain_for(request: &Request) -> Option<Self> {
+        if request.options & MEMORY_SOURCE != 0 || request.validate().is_err() {
+            return None;
+        }
+        // A file request has a live file object when the title enqueues it.
+        let file = request.source.cast_mut().cast::<Instance<File>>();
+        add_ref_instance(file);
+        Some(Self(file))
+    }
+}
+
+impl Drop for FileRef {
+    fn drop(&mut self) {
+        release(self.0);
+    }
 }
 
 /// The streaming trace (`VICTORY_DSTORAGE_TRACE`): 0 or unset: off; 1: a
@@ -1270,7 +1310,8 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
         return;
     };
     let note = Note::enqueued(&request);
-    queue(this, Command::Read(Read { request, note }));
+    let source_file = FileRef::retain_for(&request);
+    queue(this, Command::Read(Read { request, note, source_file }));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -1389,18 +1430,10 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         );
         hr
     };
-    if options & !(ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE) != 0 {
-        return Err(fail(E_NOTIMPL, "unsupported options"));
-    }
-    if request.source.is_null() || request.destination.is_null() {
-        return Err(fail(E_INVALIDARG, "no source or destination"));
-    }
+    request.validate().map_err(|(hr, why)| fail(hr, why))?;
     let bc = ((options & BCPACK) >> 1) as u8;
     let size = request.destination_size as usize;
     if options & (ZLIB | BCPACK) == 0 {
-        if request.source_size > request.destination_size {
-            return Err(fail(E_INVALIDARG, "source larger than destination"));
-        }
         let size = request.source_size as usize;
         return into_destination(request, size, |out| read_into(request, out).map(|()| size))
             .map_err(|hr| fail(hr, "copying"));
@@ -1545,7 +1578,8 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
         return Ok(());
     }
-    // SAFETY: a file object we created; the title keeps it open.
+    // SAFETY: the worker owns a file reference for this read. Tests calling
+    // `execute` directly keep their source open.
     let files = &unsafe { &*request.source.cast::<Instance<File>>() }
         .state
         .files;
@@ -1908,6 +1942,55 @@ mod tests {
     }
 
     #[test]
+    fn queued_reads_keep_their_source_after_the_caller_releases_it() {
+        let plain = pattern(256);
+        let (dir, file) = file_with(&plain);
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut out = [0u8; 64];
+        let read = request(0, out.as_mut_ptr().cast(), out.len(), file, 17, out.len());
+        enqueue(queue, &read);
+        // Fail before submitting if the last reference was lost.
+        assert_eq!(release(file.cast::<Instance<File>>()), 1);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(out, plain[17..81]);
+        // The handles were opened without FILE_SHARE_DELETE.
+        std::fs::remove_file(dir.path().join("data.bin")).unwrap();
+        assert_eq!(release(queue.cast::<Instance<Queue>>()), 0);
+        assert_eq!(release(array.cast::<Instance<StatusArray>>()), 0);
+    }
+
+    #[test]
+    fn closing_a_queue_releases_the_sources_of_unsubmitted_reads() {
+        let (dir, file) = file_with(&pattern(256));
+        let queue = new_queue(0);
+        let mut out = [0xa5u8; 64];
+        let read = request(0, out.as_mut_ptr().cast(), out.len(), file, 0, out.len());
+        enqueue(queue, &read);
+        assert_eq!(release(file.cast::<Instance<File>>()), 1);
+        void(queue, 0x40);
+        assert_eq!(out, [0xa5; 64]);
+        std::fs::remove_file(dir.path().join("data.bin")).unwrap();
+        assert_eq!(release(queue.cast::<Instance<Queue>>()), 0);
+    }
+
+    #[test]
+    fn rejected_requests_do_not_take_a_source_reference() {
+        let (_dir, file) = file_with(&[0; 8]);
+        let mut out = [0u8; 4];
+        let oversized = request(0, out.as_mut_ptr().cast(), out.len(), file, 0, 8);
+        let unsupported = Request {
+            options: 1 << 23,
+            source_size: oversized.destination_size,
+            ..oversized
+        };
+        assert!(FileRef::retain_for(&oversized).is_none());
+        assert!(FileRef::retain_for(&unsupported).is_none());
+        assert_eq!(release(file.cast::<Instance<File>>()), 0);
+    }
+
+    #[test]
     fn raw_and_zlib_reads_from_a_file() {
         let plain = pattern(300_000);
         let packed = compress_zlib(&plain);
@@ -2226,7 +2309,7 @@ mod tests {
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
         let note = Note::default();
-        lane.unsubmitted.push(Command::Read(Read { request: r, note }));
+        lane.unsubmitted.push(Command::Read(Read { request: r, note, source_file: None }));
     }
 
     #[test]
