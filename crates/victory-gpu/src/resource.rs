@@ -1781,9 +1781,14 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 fn texture_budget_bytes() -> Option<u64> {
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
-        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+        let value = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
+        parse_texture_budget_bytes(&value)
     })
+}
+
+#[cfg(any(windows, test))]
+fn parse_texture_budget_bytes(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok()?.checked_mul(1 << 20)
 }
 
 #[cfg(windows)]
@@ -4717,6 +4722,14 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    #[test]
+    fn texture_budget_rejects_overflow_when_converting_to_bytes() {
+        const MIB: u64 = 1 << 20;
+        let max_mib = u64::MAX / MIB;
+        assert_eq!(parse_texture_budget_bytes(&max_mib.to_string()), Some(u64::MAX - (MIB - 1)));
+        assert_eq!(parse_texture_budget_bytes(&(max_mib + 1).to_string()), None);
     }
 
     #[test]
