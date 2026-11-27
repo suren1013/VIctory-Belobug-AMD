@@ -36,6 +36,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+      - name: Frame-meter summary fixture
+        run: ./scripts/test-summarize-perf.ps1
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       # Includes xtask's repository_passes_policy, the asset-policy check.
