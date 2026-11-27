@@ -121,6 +121,46 @@ impl Cursor<'_> {
         self.pos += 8;
         Some(byte)
     }
+
+    fn frame_bytes(&mut self, bits: usize) -> Option<Vec<u8>> {
+        let offset = self.pos % PACKET_BITS;
+        let tail = bits % 8;
+        let len = bits.div_ceil(8);
+        if offset >= HEADER_BITS && bits <= PACKET_BITS - offset {
+            // This frame is contiguous. Check the source range once, then
+            // copy or shift without checking for a packet edge on every byte.
+            let shift = self.pos % 8;
+            let at = self.pos / 8;
+            let data = self.data.get(at..)?.get(..(shift + bits).div_ceil(8))?;
+            let mut out = if shift == 0 {
+                data.to_vec()
+            } else {
+                let mut out = Vec::with_capacity(len);
+                out.extend(
+                    data.windows(2)
+                        .map(|pair| (pair[0] << shift) | (pair[1] >> (8 - shift))),
+                );
+                if out.len() < len {
+                    out.push(data[data.len() - 1] << shift);
+                }
+                out
+            };
+            if tail != 0 {
+                out[len - 1] &= u8::MAX << (8 - tail);
+            }
+            self.pos += bits;
+            return Some(out);
+        }
+
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..bits / 8 {
+            out.push(self.byte()?);
+        }
+        if tail != 0 {
+            out.push((self.bits(tail as u32)? << (8 - tail)) as u8);
+        }
+        Some(out)
+    }
 }
 
 /// Reads the frame starting at bit `start` (a frame start inside a packet's
@@ -131,15 +171,8 @@ pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
     if bits <= LENGTH_BITS as usize || bits == 0x7fff {
         return None;
     }
-    let mut out = Vec::with_capacity(bits.div_ceil(8));
-    let mut cursor = Cursor { data, pos: start };
-    for _ in 0..bits / 8 {
-        out.push(cursor.byte()?);
-    }
-    let tail = (bits % 8) as u32;
-    if tail != 0 {
-        out.push((cursor.bits(tail)? << (8 - tail)) as u8);
-    }
+    cursor.pos = start;
+    let out = cursor.frame_bytes(bits)?;
     let end = cursor.pos;
     let next = next_frame(data, start, end);
     Some(Frame {
@@ -1460,6 +1493,37 @@ mod tests {
                 if expected.is_some() {
                     assert_eq!(bytes.pos, bits.pos);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn frames_inside_one_packet_match_msb_first_bits() {
+        for shift in 0..8 {
+            let start = PACKET_BITS - 256 + shift;
+            // Exercise byte boundaries and every possible partial last byte.
+            // The longest case uses the last bit of the packet exactly.
+            for bits in 249 - shift..=256 - shift {
+                let mut data: Vec<_> = (0..3 * PACKET_BYTES).map(|i| (i * 37 + 11) as u8).collect();
+                let header = (1 << 26) | (((start - HEADER_BITS) as u32) << 11) | 1;
+                // Packet 1 belongs to another stream. The next frame begins in packet 2.
+                set_bits(&mut data, 0, 32, header);
+                set_bits(&mut data, 2 * PACKET_BITS, 32, 1 << 26);
+                set_bits(&mut data, start, LENGTH_BITS, bits as u32);
+
+                let mut expected = vec![0; bits.div_ceil(8)];
+                for pos in 0..bits {
+                    let source = start + pos;
+                    let bit = (data[source / 8] >> (7 - source % 8)) & 1;
+                    expected[pos / 8] |= bit << (7 - pos % 8);
+                }
+                let frame = read_frame(&data, start).unwrap();
+                assert_eq!(frame.data, expected, "shift {shift}, length {bits}");
+                assert_eq!(
+                    (frame.bits, frame.next),
+                    (bits, Some(2 * PACKET_BITS + HEADER_BITS))
+                );
+                assert!(read_frame(&data[..(start + bits).div_ceil(8) - 1], start).is_none());
             }
         }
     }
