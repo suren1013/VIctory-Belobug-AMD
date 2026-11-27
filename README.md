@@ -52,6 +52,22 @@ The 10.5 GB of VRAM in the RX 7900 XTX table is the usage reported for that run.
 Memory use and frame time depend on the scene and settings. The [ray-tracing notes](docs/fork-ray-tracing.md)
 describe which lighting paths run and the remaining rendering issues.
 
+To compare runs, save the launcher's output outside the repository and summarize
+the same scene from each log. In PowerShell, run these commands from the repository:
+
+```powershell
+$log = "$env:TEMP\victory-run.log"
+.\scripts\play.ps1 -Exe 'D:\path\to\game.exe' 2>&1 |
+    ForEach-Object { $_.ToString() } | Tee-Object -FilePath $log
+.\scripts\summarize-perf.ps1 -Log $log -Skip 10 -Take 30
+```
+
+`-Skip` and `-Take` count frame-meter entries. Omit both to use every entry in the
+log. Each entry covers about one second of presents, sampled about every five
+seconds. The Markdown table gives each logged interval equal weight. Its
+frame-time values are averages within those intervals. Include your build, GPU,
+settings and scene alongside the table when sharing results.
+
 ### Renderer patches (off by default while they are tested)
 
 | Switch | What it does |
